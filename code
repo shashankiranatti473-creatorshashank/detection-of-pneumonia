@@ -1,0 +1,905 @@
+from google.colab import drive
+drive.mount('/content/drive')
+
+--------------------------------------------------------------------------------------------------
+
+!ls "/content/drive/MyDrive"
+
+------------------------------------------------------------------------------------------------------
+
+!unzip "/content/drive/MyDrive/pneumonia.zip" -d "/content/data"
+
+------------------------------------------------------------------------------------------------------
+
+
+!ls /content/data
+
+------------------------------------------------------------------------------------------------------
+
+
+!ls /content/data/chest_xray
+
+------------------------------------------------------------------------------------------------------
+
+
+!ls -la /content/data
+!ls -la /content/data/chest_xray || true
+
+------------------------------------------------------------------------------------------------------
+
+
+BASE = "/content/data/chest_xray"
+
+------------------------------------------------------------------------------------------------------
+
+
+BASE = "/content/data"
+
+------------------------------------------------------------------------------------------------------
+
+
+# safe remove if it exists
+import shutil, os
+macos = "/content/data/__MACOSX"
+if os.path.exists(macos):
+    shutil.rmtree(macos)
+    print("__MACOSX removed")
+else:
+    print("__MACOSX not found")
+
+
+------------------------------------------------------------------------------------------------------
+
+
+# === Full end-to-end: train -> metrics -> confusion -> Grad-CAM ===
+import os, numpy as np, matplotlib.pyplot as plt
+from tensorflow.keras.preprocessing.image import ImageDataGenerator, img_to_array, load_img
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+from tensorflow.keras.optimizers import Adam
+import tensorflow as tf
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, balanced_accuracy_score
+import seaborn as sns
+from skimage.transform import resize
+
+# ---- EDIT HERE if needed ----
+BASE = "/content/data/chest_xray"   # <- MOST LIKELY CORRECT FOR YOU
+img_size = (224,224)
+batch_size = 32
+model_path = "/content/pneumonia_model.h5"
+# -----------------------------
+
+# 1) Generators
+train_gen = ImageDataGenerator(rescale=1./255)
+val_gen   = ImageDataGenerator(rescale=1./255)
+test_gen  = ImageDataGenerator(rescale=1./255)
+
+train = train_gen.flow_from_directory(
+    os.path.join(BASE,"train"),
+    target_size=img_size,
+    color_mode="grayscale",
+    class_mode="binary",
+    batch_size=batch_size,
+    shuffle=True
+)
+val = val_gen.flow_from_directory(
+    os.path.join(BASE,"val"),
+    target_size=img_size,
+    color_mode="grayscale",
+    class_mode="binary",
+    batch_size=batch_size,
+    shuffle=False
+)
+test = test_gen.flow_from_directory(
+    os.path.join(BASE,"test"),
+    target_size=img_size,
+    color_mode="grayscale",
+    class_mode="binary",
+    batch_size=1,
+    shuffle=False
+)
+
+inv_class_indices = {v:k for k,v in train.class_indices.items()}
+
+# 2) Model (load if exists)
+if os.path.exists(model_path):
+    print("Loading saved model:", model_path)
+    model = load_model(model_path)
+else:
+    model = Sequential([
+        Conv2D(32,(3,3),activation='relu',input_shape=(img_size[0],img_size[1],1)),
+        MaxPooling2D(2,2),
+        Conv2D(64,(3,3),activation='relu'),
+        MaxPooling2D(2,2),
+        Conv2D(128,(3,3),activation='relu'),
+        MaxPooling2D(2,2),
+        Flatten(),
+        Dense(128,activation='relu'),
+        Dropout(0.3),
+        Dense(1,activation='sigmoid')
+    ])
+    model.compile(optimizer=Adam(1e-4), loss='binary_crossentropy', metrics=['accuracy'])
+    model.summary()
+    print("Training model (this may take a while)...")
+    history = model.fit(train, validation_data=val, epochs=8)
+    model.save(model_path)
+    print("Saved model to", model_path)
+
+# 3) Plot accuracy & loss if history exists
+try:
+    hist = history
+    plt.figure(figsize=(12,4))
+    plt.subplot(1,2,1)
+    plt.plot(hist.history['accuracy'], label='train')
+    plt.plot(hist.history['val_accuracy'], label='val')
+    plt.title('Accuracy'); plt.legend()
+    plt.subplot(1,2,2)
+    plt.plot(hist.history['loss'], label='train')
+    plt.plot(hist.history['val_loss'], label='val')
+    plt.title('Loss'); plt.legend()
+    plt.show()
+except NameError:
+    print("No history object (model was loaded).")
+
+# 4) Evaluate on test set -> predictions, probs
+y_true, y_pred, y_prob = [], [], []
+for i in range(len(test)):
+    x,y = test[i]
+    prob = float(model.predict(x, verbose=0))
+    pred = 1 if prob >= 0.5 else 0
+    y_true.append(int(y[0]))
+    y_pred.append(pred)
+    y_prob.append(prob)
+
+# Metrics
+acc = accuracy_score(y_true, y_pred)
+bacc = balanced_accuracy_score(y_true, y_pred)
+print(f"Overall accuracy: {acc:.4f}  Balanced acc: {bacc:.4f}")
+cm = confusion_matrix(y_true, y_pred)
+labels = [inv_class_indices[i] for i in sorted(inv_class_indices.keys())]
+print("Confusion matrix:\n", cm)
+plt.figure(figsize=(5,4)); sns.heatmap(cm, annot=True, fmt='d', xticklabels=labels, yticklabels=labels); plt.xlabel('Pred'); plt.ylabel('True'); plt.show()
+print("\nClassification report:\n", classification_report(y_true, y_pred, target_names=labels))
+
+# 5) Grad-CAM: build functional wrapper that reuses layers
+inp = tf.keras.Input(shape=(img_size[0],img_size[1],1))
+x = inp
+last_conv_output = None
+for layer in model.layers:
+    x = layer(x)
+    if isinstance(layer, tf.keras.layers.Conv2D):
+        last_conv_output = x
+if last_conv_output is None:
+    raise RuntimeError("No Conv2D found in model.")
+
+wrapper = tf.keras.Model(inputs=inp, outputs=[last_conv_output, x])
+print("Wrapper built.")
+
+def gradcam_heatmap(img_array):
+    with tf.GradientTape() as tape:
+        conv_out, preds = wrapper(img_array, training=False)
+        score = preds[:,0]
+    grads = tape.gradient(score, conv_out)
+    if grads is None:
+        raise RuntimeError("grads is None.")
+    pooled = tf.reduce_mean(grads, axis=(0,1,2))
+    conv = conv_out[0]
+    heat = tf.zeros(conv.shape[:2], dtype=tf.float32)
+    for i in range(conv.shape[-1]):
+        heat += pooled[i] * conv[:,:,i]
+    heat = tf.maximum(heat,0)
+    maxv = tf.reduce_max(heat)
+    if maxv==0:
+        return np.zeros((heat.shape[0],heat.shape[1]))
+    heat /= maxv
+    return heat.numpy()
+
+def show_gradcam(idx):
+    path = test.filepaths[idx]
+    orig = load_img(path, color_mode='grayscale', target_size=img_size)
+    x = img_to_array(orig)/255.0
+    x_in = np.expand_dims(x,0).astype(np.float32)
+    h = gradcam_heatmap(x_in)
+    h_resized = resize(h, img_size, preserve_range=True)
+    h_img = np.uint8(255*h_resized)
+    cmap = plt.get_cmap('jet'); colored = cmap(h_img/255.0)[:,:,:3]
+    orig_arr = np.squeeze(np.array(orig)); orig_rgb = np.stack([orig_arr]*3,axis=-1)/255.0
+    overlay = 0.5*orig_rgb + 0.5*colored
+    plt.figure(figsize=(10,4))
+    plt.subplot(1,3,1); plt.imshow(orig_arr, cmap='gray'); plt.axis('off'); plt.title('Original')
+    plt.subplot(1,3,2); plt.imshow(h_img, cmap='jet'); plt.axis('off'); plt.title('Heatmap')
+    plt.subplot(1,3,3); plt.imshow(overlay); plt.axis('off'); plt.title('Overlay')
+    plt.suptitle(f"True:{inv_class_indices[y_true[idx]]} Pred:{inv_class_indices[y_pred[idx]]} Prob:{y_prob[idx]:.3f}")
+    plt.show()
+
+# show up to 6 examples
+for i in range(min(6, len(test.filepaths))):
+    show_gradcam(i)
+
+print("All done.")
+
+------------------------------------------------------------------------------------------------------
+
+
+
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report
+import numpy as np
+
+# Overall accuracy
+overall_acc = accuracy_score(y_true, y_pred)
+print("Overall Accuracy:", overall_acc)
+print(f"Overall Accuracy (%): {overall_acc*100:.2f}%")
+
+# Balanced accuracy
+bal_acc = balanced_accuracy_score(y_true, y_pred)
+print("Balanced Accuracy:", bal_acc)
+print(f"Balanced Accuracy (%): {bal_acc*100:.2f}%")
+
+# Per-class accuracy (same as recall/sensitivity for each class)
+cm = confusion_matrix(y_true, y_pred)
+per_class_acc = np.diag(cm) / cm.sum(axis=1)
+
+labels = [inv_class_indices[i] for i in sorted(inv_class_indices.keys())]
+print("\nPer-Class Accuracy:")
+for lbl, acc in zip(labels, per_class_acc):
+    print(f"{lbl}: {acc*100:.2f}%")
+
+# Detailed precision/recall/F1
+print("\nClassification Report:")
+print(classification_report(y_true, y_pred, target_names=labels))
+
+
+------------------------------------------------------------------------------------------------------
+
+
+import tensorflow as tf
+from tensorflow.keras.applications import DenseNet121
+from tensorflow.keras.layers import Input, Dense, GlobalAveragePooling2D, Dropout
+from tensorflow.keras.models import Model
+
+# ============================
+# DenseNet121 BASE
+# ============================
+input_tensor = Input(shape=(224, 224, 3))  # DenseNet needs 3 channels
+
+# Convert grayscale generator output (1 channel) to 3-channel
+# (model will broadcast automatically)
+base_model = DenseNet121(weights='imagenet', include_top=False, input_tensor=input_tensor)
+
+# Freeze the base model to train faster
+for layer in base_model.layers:
+    layer.trainable = False
+
+x = base_model.output
+x = GlobalAveragePooling2D()(x)
+x = Dropout(0.3)(x)
+output = Dense(1, activation='sigmoid')(x)
+
+model = Model(inputs=input_tensor, outputs=output)
+
+model.compile(optimizer=tf.keras.optimizers.Adam(1e-4),
+              loss='binary_crossentropy',
+              metrics=['accuracy'])
+
+model.summary()
+
+
+------------------------------------------------------------------------------------------------------
+
+
+# DenseNet121 transfer learning + fine-tune pipeline (copy-paste)
+import os, numpy as np
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.applications import DenseNet121
+from tensorflow.keras.layers import Input, GlobalAveragePooling2D, Dropout, Dense
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau, EarlyStopping
+
+# ----- EDIT these if needed -----
+BASE = "/content/data/chest_xray"   # your dataset root
+img_size = (224,224)
+batch_size = 16
+MODEL_PATH = "/content/densenet_pneumonia.h5"
+initial_epochs = 5
+fine_tune_epochs = 10
+# ---------------------------------
+
+# 1) Generators with DenseNet preprocessing and augmentation for training
+preprocess = tf.keras.applications.densenet.preprocess_input
+
+train_aug = ImageDataGenerator(
+    preprocessing_function=preprocess,
+    rotation_range=10,
+    width_shift_range=0.06,
+    height_shift_range=0.06,
+    zoom_range=0.08,
+    horizontal_flip=True,
+    fill_mode='nearest'
+)
+val_gen = ImageDataGenerator(preprocessing_function=preprocess)
+test_gen = ImageDataGenerator(preprocessing_function=preprocess)
+
+train = train_aug.flow_from_directory(
+    os.path.join(BASE,"train"),
+    target_size=img_size,
+    color_mode="rgb",
+    class_mode="binary",
+    batch_size=batch_size,
+    shuffle=True
+)
+val = val_gen.flow_from_directory(
+    os.path.join(BASE,"val"),
+    target_size=img_size,
+    color_mode="rgb",
+    class_mode="binary",
+    batch_size=batch_size,
+    shuffle=False
+)
+test = test_gen.flow_from_directory(
+    os.path.join(BASE,"test"),
+    target_size=img_size,
+    color_mode="rgb",
+    class_mode="binary",
+    batch_size=1,
+    shuffle=False
+)
+
+inv_class_indices = {v:k for k,v in train.class_indices.items()}
+
+# 2) Build DenseNet121 model (frozen base)
+input_tensor = Input(shape=(img_size[0], img_size[1], 3))
+base = DenseNet121(weights='imagenet', include_top=False, input_tensor=input_tensor)
+x = base.output
+x = GlobalAveragePooling2D()(x)
+x = Dropout(0.3)(x)
+out = Dense(1, activation='sigmoid')(x)
+model = Model(inputs=input_tensor, outputs=out)
+
+# freeze base
+for layer in base.layers:
+    layer.trainable = False
+
+model.compile(optimizer=Adam(1e-4), loss='binary_crossentropy', metrics=['accuracy'])
+model.summary()
+
+# 3) Callbacks
+ckpt = ModelCheckpoint(MODEL_PATH, monitor='val_loss', save_best_only=True, verbose=1)
+rlr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
+es  = EarlyStopping(monitor='val_loss', patience=6, restore_best_weights=True, verbose=1)
+
+# 4) Train head
+history1 = model.fit(train, validation_data=val, epochs=initial_epochs, callbacks=[ckpt, rlr], verbose=1)
+
+# 5) Fine-tune: unfreeze last N layers of the base
+# Choose how many layers to unfreeze: here we unfreeze last 50 layers (tuneable)
+unfreeze_from = -50
+for layer in base.layers[unfreeze_from:]:
+    layer.trainable = True
+
+# recompile with smaller LR
+model.compile(optimizer=Adam(1e-5), loss='binary_crossentropy', metrics=['accuracy'])
+model.summary()
+
+# 6) Continue training (fine-tuning)
+history2 = model.fit(train, validation_data=val, epochs=fine_tune_epochs, callbacks=[ckpt, rlr, es], verbose=1)
+
+# Load the best saved model
+model = load_model(MODEL_PATH)
+print("Loaded best model:", MODEL_PATH)
+
+# 7) Evaluate on test set (get preds & probs)
+y_true, y_pred, y_prob = [], [], []
+for i in range(len(test)):
+    x,y = test[i]
+    prob = float(model.predict(x, verbose=0))
+    pred = 1 if prob >= 0.5 else 0
+    y_true.append(int(y[0])); y_pred.append(pred); y_prob.append(prob)
+
+# Print basic metrics
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, classification_report, confusion_matrix
+print("Test accuracy:", accuracy_score(y_true, y_pred))
+print("Balanced acc:", balanced_accuracy_score(y_true, y_pred))
+print("\nClassification report:\n", classification_report(y_true, y_pred, target_names=[inv_class_indices[i] for i in sorted(inv_class_indices.keys())]))
+print("\nConfusion matrix:\n", confusion_matrix(y_true, y_pred))
+
+# 8) Build a functional wrapper for Grad-CAM (reusing trained weights)
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+from skimage.transform import resize
+import matplotlib.pyplot as plt
+inp = tf.keras.Input(shape=(img_size[0], img_size[1], 3))
+x = inp
+last_conv_output = None
+for layer in model.layers:
+    x = layer(x)
+    if isinstance(layer, tf.keras.layers.Conv2D):
+        last_conv_output = x
+if last_conv_output is None:
+    raise RuntimeError("No Conv2D in model!")
+
+gradcam_wrapper = tf.keras.Model(inputs=inp, outputs=[last_conv_output, x])
+print("Grad-CAM wrapper built.")
+
+# save final model to Drive if needed
+# !cp /content/densenet_pneumonia.h5 "/content/drive/MyDrive/densenet_pneumonia.h5"
+
+------------------------------------------------------------------------------------------------------
+
+
+
+# ===== DenseNet Grad-CAM (no layer looping, no errors) =====
+import tensorflow as tf
+import numpy as np
+import matplotlib.pyplot as plt
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+from skimage.transform import resize
+
+# 1) Identify last conv layer automatically
+last_conv_layer_name = None
+for layer in model.layers[::-1]:
+    if isinstance(layer, tf.keras.layers.Conv2D):
+        last_conv_layer_name = layer.name
+        break
+
+print("Last Conv Layer:", last_conv_layer_name)
+
+# 2) Build grad-model: inputs -> (last conv output, final output)
+grad_model = tf.keras.models.Model(
+    inputs=model.input,
+    outputs=[
+        model.get_layer(last_conv_layer_name).output,
+        model.output
+    ]
+)
+
+# 3) Grad-CAM heatmap function
+def make_gradcam_heatmap(img_array):
+    with tf.GradientTape() as tape:
+        conv_output, preds = grad_model(img_array)
+        class_score = preds[:, 0]   # sigmoid output
+
+    grads = tape.gradient(class_score, conv_output)
+
+    # global average pooling the gradients
+    pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+    conv_output = conv_output[0].numpy()
+
+    heatmap = np.zeros(conv_output.shape[:2], dtype=np.float32)
+
+    for i in range(conv_output.shape[-1]):
+        heatmap += pooled_grads[i] * conv_output[:, :, i]
+
+    heatmap = np.maximum(heatmap, 0)
+    heatmap /= np.max(heatmap) + 1e-8
+
+    return heatmap
+
+# 4) Show Grad-CAM for a test index
+def show_gradcam(idx):
+    filepath = test.filepaths[idx]
+
+    img = load_img(filepath, target_size=(224,224))
+    img_arr = img_to_array(img)
+    img_pre = tf.keras.applications.densenet.preprocess_input(img_arr.copy())
+    img_pre = np.expand_dims(img_pre, axis=0)
+
+    heatmap = make_gradcam_heatmap(img_pre)
+    heatmap = resize(heatmap, (224,224), preserve_range=True)
+
+    heatmap = np.uint8(255 * heatmap)
+    cmap = plt.get_cmap("jet")
+    colored = cmap(heatmap / 255.0)[:, :, :3]
+
+    orig = img_arr / 255.0
+    overlay = 0.5 * orig + 0.5 * colored
+
+    plt.figure(figsize=(10,4))
+    plt.subplot(1,3,1); plt.imshow(orig); plt.axis("off"); plt.title("Original")
+    plt.subplot(1,3,2); plt.imshow(heatmap, cmap='jet'); plt.axis("off"); plt.title("Heatmap")
+    plt.subplot(1,3,3); plt.imshow(overlay); plt.axis("off"); plt.title("Overlay")
+    plt.show()
+
+# Show 3 examples
+for i in range(3):
+    show_gradcam(i)
+
+print("Grad-CAM complete.")
+
+------------------------------------------------------------------------------------------------------
+
+
+
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix, classification_report
+import numpy as np
+
+# Overall accuracy
+acc = accuracy_score(y_true, y_pred)
+print(f"Overall Accuracy: {acc:.4f}  ({acc*100:.2f}%)")
+
+# Balanced accuracy (useful for imbalanced datasets)
+bacc = balanced_accuracy_score(y_true, y_pred)
+print(f"Balanced Accuracy: {bacc:.4f}  ({bacc*100:.2f}%)")
+
+# Confusion matrix
+cm = confusion_matrix(y_true, y_pred)
+print("\nConfusion Matrix:\n", cm)
+
+# Per-class accuracy (Recall for each class)
+per_class_acc = np.diag(cm) / cm.sum(axis=1)
+labels = [inv_class_indices[i] for i in sorted(inv_class_indices.keys())]
+
+print("\nPer-Class Accuracy:")
+for lbl, acc_c in zip(labels, per_class_acc):
+    print(f"{lbl}: {acc_c*100:.2f}%")
+
+# Detailed classification report
+print("\nClassification Report:")
+print(classification_report(y_true, y_pred, target_names=labels))
+
+
+------------------------------------------------------------------------------------------------------
+
+
+from sklearn.metrics import confusion_matrix
+import seaborn as sns
+import matplotlib.pyplot as plt
+import numpy as np
+
+# Compute confusion matrix
+cm = confusion_matrix(y_true, y_pred)
+print("Confusion Matrix:\n", cm)
+
+# Get class labels (example: ['NORMAL', 'PNEUMONIA'])
+labels = [inv_class_indices[i] for i in sorted(inv_class_indices.keys())]
+
+# Plot heatmap
+plt.figure(figsize=(6,5))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=labels, yticklabels=labels)
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.title("Confusion Matrix")
+plt.show()
+
+
+------------------------------------------------------------------------------------------------------
+
+
+cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+
+plt.figure(figsize=(6,5))
+sns.heatmap(cm_norm, annot=True, fmt=".2f", cmap='Greens',
+            xticklabels=labels, yticklabels=labels)
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.title("Normalized Confusion Matrix (%)")
+plt.show()
+
+
+------------------------------------------------------------------------------------------------------
+
+
+# ==== Fine-tune + threshold tuning pipeline (one cell). Paste & run in Colab ====
+import os, numpy as np, matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from tensorflow.keras.callbacks import ModelCheckpoint, ReduceLROnPlateau, EarlyStopping
+from tensorflow.keras.optimizers import Adam
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import (confusion_matrix, classification_report,
+                             accuracy_score, balanced_accuracy_score,
+                             roc_curve, auc, f1_score, precision_recall_fscore_support)
+
+# ---------- USER EDITABLE SETTINGS ----------
+BASE = "/content/data/chest_xray"   # dataset root (change if different)
+img_size = (224,224)
+batch_size = 16
+MODEL_PATH = "/content/densenet_pneumonia.h5"   # path to load/save model
+unfreeze_last_n = 100       # how many DenseNet layers to unfreeze (tuneable)
+initial_lr = 1e-4
+fine_tune_lr = 1e-5
+initial_epochs = 3         # head fine-tune (short)
+fine_tune_epochs = 10      # further fine-tune
+# ------------------------------------------------
+
+# 1) Generators (augmentation + DenseNet preprocess)
+preprocess = tf.keras.applications.densenet.preprocess_input
+train_aug = ImageDataGenerator(
+    preprocessing_function=preprocess,
+    rotation_range=10,
+    width_shift_range=0.06,
+    height_shift_range=0.06,
+    zoom_range=0.08,
+    brightness_range=(0.9,1.1),
+    horizontal_flip=False, # typically don't flip medically, set True only if safe
+    fill_mode='nearest'
+)
+val_gen = ImageDataGenerator(preprocessing_function=preprocess)
+test_gen = ImageDataGenerator(preprocessing_function=preprocess)
+
+train = train_aug.flow_from_directory(
+    os.path.join(BASE,"train"),
+    target_size=img_size,
+    color_mode="rgb",
+    class_mode="binary",
+    batch_size=batch_size,
+    shuffle=True
+)
+val = val_gen.flow_from_directory(
+    os.path.join(BASE,"val"),
+    target_size=img_size,
+    color_mode="rgb",
+    class_mode="binary",
+    batch_size=batch_size,
+    shuffle=False
+)
+test = test_gen.flow_from_directory(
+    os.path.join(BASE,"test"),
+    target_size=img_size,
+    color_mode="rgb",
+    class_mode="binary",
+    batch_size=1,
+    shuffle=False
+)
+
+inv_class_indices = {v:k for k,v in train.class_indices.items()}
+
+# 2) Compute class weights from train.classes (helps reduce FP/underrepresented class issues)
+y_train_classes = np.array(train.classes)
+classes = np.unique(y_train_classes)
+cw = compute_class_weight(class_weight='balanced', classes=classes, y=y_train_classes)
+class_weights = {int(c): float(w) for c,w in zip(classes, cw)}
+print("Class weights:", class_weights)
+
+# 3) Load model (if exists) or fail with helpful message
+try:
+    model
+    print("Using model already in session.")
+except NameError:
+    if os.path.exists(MODEL_PATH):
+        print("Loading model from", MODEL_PATH)
+        model = tf.keras.models.load_model(MODEL_PATH)
+    else:
+        raise RuntimeError(f"No model found in session and {MODEL_PATH} does not exist. Run DenseNet build cell first.")
+
+# 4) Freeze base then train head for a few epochs (if not done)
+# If you already trained head earlier, this will still run but quickly
+# Identify base (the pretrained part). We assume model was built from DenseNet121 earlier.
+# We'll detect and freeze all layers except the top classifier layers initially.
+for layer in model.layers:
+    try:
+        layer._initially_trainable = layer.trainable
+    except Exception:
+        pass
+# freeze all
+for layer in model.layers:
+    layer.trainable = False
+# ensure classifier head is trainable (last few layers)
+for layer in model.layers[-6:]:
+    layer.trainable = True
+
+model.compile(optimizer=Adam(initial_lr), loss='binary_crossentropy', metrics=['accuracy'])
+print("Training head (few epochs)...")
+ckpt = ModelCheckpoint(MODEL_PATH, monitor='val_loss', save_best_only=True, verbose=1)
+rlr = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=3, verbose=1)
+es = EarlyStopping(monitor='val_loss', patience=6, restore_best_weights=True, verbose=1)
+
+history1 = model.fit(train, validation_data=val, epochs=initial_epochs, callbacks=[ckpt, rlr], class_weight=class_weights)
+
+# 5) Unfreeze last N layers of the base for fine-tuning
+# Find a sensible split: unfreeze last `unfreeze_last_n` layers in the model
+# (for DenseNet this is OK; tune unfreeze_last_n if OOM or overfitting)
+total_layers = len(model.layers)
+start_unfreeze = max(0, total_layers - unfreeze_last_n)
+for i,layer in enumerate(model.layers):
+    layer.trainable = True if i >= start_unfreeze else False
+
+print(f"Unfreezing layers from {start_unfreeze} to {total_layers-1} (total layers {total_layers})")
+model.compile(optimizer=Adam(fine_tune_lr), loss='binary_crossentropy', metrics=['accuracy'])
+
+# 6) Fine-tune with callbacks
+history2 = model.fit(train, validation_data=val, epochs=fine_tune_epochs, callbacks=[ckpt, rlr, es], class_weight=class_weights)
+
+# load best model
+model = tf.keras.models.load_model(MODEL_PATH)
+print("Loaded best model from checkpoint.")
+
+# 7) Evaluate on test set and collect probs
+y_true, y_pred, y_prob = [], [], []
+for i in range(len(test)):
+    x,y = test[i]
+    prob = float(model.predict(x, verbose=0))
+    y_true.append(int(y[0]))
+    y_prob.append(prob)
+    y_pred.append(1 if prob >= 0.5 else 0)
+
+# Basic metrics at 0.5
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, balanced_accuracy_score
+cm_05 = confusion_matrix(y_true, y_pred)
+acc_05 = accuracy_score(y_true, y_pred)
+bacc_05 = balanced_accuracy_score(y_true, y_pred)
+print("\nMetrics at threshold 0.5:")
+print("Accuracy:", acc_05)
+print("Balanced Acc:", bacc_05)
+print("Confusion Matrix:\n", cm_05)
+print("\nClassification report:\n", classification_report(y_true, y_pred, target_names=[inv_class_indices[i] for i in sorted(inv_class_indices.keys())]))
+
+# 8) ROC & threshold sweep to pick best threshold (Youden's J or max F1)
+fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+roc_auc = auc(fpr, tpr)
+youden = tpr - fpr
+best_idx = np.argmax(youden)
+best_thresh_youden = thresholds[best_idx]
+# also best F1
+best_f1 = -1; best_thresh_f1 = 0.5
+for th in np.linspace(0.1, 0.95, 85):
+    preds = (np.array(y_prob) >= th).astype(int)
+    f1 = f1_score(y_true, preds)
+    if f1 > best_f1:
+        best_f1 = f1; best_thresh_f1 = th
+
+print(f"\nROC AUC: {roc_auc:.4f}")
+print(f"Best threshold (Youden's J): {best_thresh_youden:.3f}")
+print(f"Best threshold (max F1): {best_thresh_f1:.3f}  (F1={best_f1:.3f})")
+
+# Plot ROC
+plt.figure(figsize=(6,5))
+plt.plot(fpr, tpr, label=f'AUC={roc_auc:.3f}')
+plt.plot([0,1],[0,1],'k--')
+plt.scatter(fpr[best_idx], tpr[best_idx], c='red', label=f"Youden th={best_thresh_youden:.3f}")
+plt.xlabel('FPR'); plt.ylabel('TPR'); plt.legend(); plt.title('ROC')
+plt.show()
+
+# 9) Evaluate at best thresholds and show confusion matrices
+def eval_at_threshold(th):
+    preds = (np.array(y_prob) >= th).astype(int)
+    cm = confusion_matrix(y_true, preds)
+    acc = accuracy_score(y_true, preds)
+    bacc = balanced_accuracy_score(y_true, preds)
+    report = classification_report(y_true, preds, target_names=[inv_class_indices[i] for i in sorted(inv_class_indices.keys())])
+    print(f"\n--- Threshold = {th:.3f} ---")
+    print("Accuracy:", acc, "Balanced Acc:", bacc)
+    print("Confusion Matrix:\n", cm)
+    print("\nClassification report:\n", report)
+    return cm
+
+cm_you = eval_at_threshold(best_thresh_youden)
+cm_f1 = eval_at_threshold(best_thresh_f1)
+
+# 10) Plot training curves (combined)
+def plot_hist(h1, h2=None):
+    if h1 is not None:
+        acc = h1.history.get('accuracy', [])
+        val_acc = h1.history.get('val_accuracy', [])
+        loss = h1.history.get('loss', [])
+        val_loss = h1.history.get('val_loss', [])
+    else:
+        acc=val_acc=loss=val_loss=[]
+    if h2 is not None:
+        acc2 = h2.history.get('accuracy', [])
+        val_acc2 = h2.history.get('val_accuracy', [])
+        loss2 = h2.history.get('loss', [])
+        val_loss2 = h2.history.get('val_loss', [])
+    else:
+        acc2=val_acc2=loss2=val_loss2=[]
+
+    plt.figure(figsize=(12,4))
+    if acc or acc2:
+        plt.subplot(1,2,1)
+        if acc: plt.plot(acc, label='train (stage1)')
+        if val_acc: plt.plot(val_acc, label='val (stage1)')
+        if acc2: plt.plot(np.arange(len(acc), len(acc)+len(acc2)), acc2, label='train (stage2)')
+        if val_acc2: plt.plot(np.arange(len(val_acc), len(val_acc)+len(val_acc2)), val_acc2, label='val (stage2)')
+        plt.title('Accuracy'); plt.legend()
+    if loss or loss2:
+        plt.subplot(1,2,2)
+        if loss: plt.plot(loss, label='train loss (s1)')
+        if val_loss: plt.plot(val_loss, label='val loss (s1)')
+        if loss2: plt.plot(np.arange(len(loss), len(loss)+len(loss2)), loss2, label='train loss (s2)')
+        if val_loss2: plt.plot(np.arange(len(val_loss), len(val_loss)+len(val_loss2)), val_loss2, label='val loss (s2)')
+        plt.title('Loss'); plt.legend()
+    plt.show()
+
+plot_hist(history1 if 'history1' in globals() else None, history2 if 'history2' in globals() else None)
+
+# 11) Save final model to Drive (optional)
+# Uncomment and set your drive path if you want to copy it
+# !cp {MODEL_PATH} "/content/drive/MyDrive/densenet_pneumonia_best.h5"
+print("\nDone. Suggestions:\n - If FP still high: increase threshold or use stronger class weights or tune unfreeze_last_n smaller/larger.\n - If overfitting: reduce unfreeze_last_n, drop LR, add augmentation.\n")
+
+
+------------------------------------------------------------------------------------------------------
+
+
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score, balanced_accuracy_score
+import numpy as np
+print("Accuracy:", accuracy_score(y_true, y_pred))
+print("Balanced accuracy:", balanced_accuracy_score(y_true, y_pred))
+cm = confusion_matrix(y_true, y_pred)
+print("Confusion matrix:\n", cm)
+print("\nClassification report:\n", classification_report(y_true, y_pred, target_names=[inv_class_indices[i] for i in sorted(inv_class_indices.keys())]))
+
+
+------------------------------------------------------------------------------------------------------
+
+
+# ===== FINAL ACCURACY CALCULATION (use best threshold) =====
+import numpy as np
+from sklearn.metrics import (
+    confusion_matrix, classification_report, accuracy_score,
+    balanced_accuracy_score, roc_curve, auc, f1_score
+)
+import matplotlib.pyplot as plt
+
+# Convert lists to arrays
+y_true = np.array(y_true)
+y_prob = np.array(y_prob)
+
+# ---------- 1) ROC & AUC ----------
+fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+roc_auc = auc(fpr, tpr)
+print(f"\nROC AUC: {roc_auc:.4f}")
+
+# ---------- 2) Best threshold (Youden’s J) ----------
+youden = tpr - fpr
+best_idx_youden = np.argmax(youden)
+best_thresh_youden = thresholds[best_idx_youden]
+print(f"Best Youden Threshold: {best_thresh_youden:.4f}")
+
+# ---------- 3) Best threshold (max F1 score) ----------
+best_f1 = -1
+best_thresh_f1 = 0.5
+for th in np.linspace(0.01, 0.99, 200):
+    preds = (y_prob >= th).astype(int)
+    f1 = f1_score(y_true, preds)
+    if f1 > best_f1:
+        best_f1 = f1
+        best_thresh_f1 = th
+
+print(f"Best F1 Threshold: {best_thresh_f1:.4f} (F1 = {best_f1:.4f})")
+
+# ---------- 4) Evaluate with both thresholds ----------
+def evaluate(th):
+    preds = (y_prob >= th).astype(int)
+    acc = accuracy_score(y_true, preds)
+    bacc = balanced_accuracy_score(y_true, preds)
+    cm = confusion_matrix(y_true, preds)
+    report = classification_report(y_true, preds, target_names=[inv_class_indices[i] for i in sorted(inv_class_indices.keys())])
+    print(f"\n=== RESULTS AT THRESHOLD {th:.4f} ===")
+    print(f"Accuracy: {acc:.4f}  ({acc*100:.2f}%)")
+    print(f"Balanced Accuracy: {bacc:.4f}")
+    print("Confusion Matrix:\n", cm)
+    print("\nClassification Report:\n", report)
+    return acc, bacc, cm
+
+# Evaluate both
+acc_youden, bacc_youden, cm_you = evaluate(best_thresh_youden)
+acc_f1, bacc_f1, cm_f1 = evaluate(best_thresh_f1)
+
+# ---------- 5) Pick BEST accuracy ----------
+final_acc = max(acc_youden, acc_f1)
+final_thresh = best_thresh_youden if acc_youden >= acc_f1 else best_thresh_f1
+
+print("\n=================================================")
+print(f"FINAL BEST ACCURACY: {final_acc*100:.2f}%")
+print(f"USE THRESHOLD: {final_thresh:.4f}")
+print("=================================================")
+
+# ---------- 6) Plot ROC curve ----------
+plt.figure(figsize=(6,6))
+plt.plot(fpr, tpr, label=f"AUC = {roc_auc:.3f}")
+plt.plot([0,1],[0,1],"k--")
+plt.scatter(fpr[best_idx_youden], tpr[best_idx_youden], c='red', label="Best Youden")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve")
+plt.legend()
+plt.show()
+
+
+------------------------------------------------------------------------------------------------------
+
+//(End of code)
